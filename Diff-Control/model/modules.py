@@ -337,22 +337,46 @@ class UNetwithControl(nn.Module):
 # -----------------------------------------------------------------------------#
 class ControlNet(nn.Module):
     """
-    input x : [bs, dim_x, window_size]
+    控制网络 (ControlNet) 主类, 继承自nn.Module
+    输入形状说明：
+    - x: [batch_size, dim_x, window_size] 输入的时间序列数据
+    - obs: 观测条件 (具体维度取决于Fusion层的实现)
+    - lang: 语言输入 (文本或语言特征)
+    - control_input: 控制信号输入
+    - time: 时间步信息
+    
+    主要结构包含：
+    - 基础U-Net架构 (编码器-瓶颈-解码器)
+    - 控制网络分支 (复制编码器结构并添加控制模块)
+    - 语言嵌入和时间位置编码
+    - 特征融合模块
     """
 
     def __init__(self, dim_x, window_size, embed_size=256, state_est=1):
+        """
+        初始化函数
+        Args:
+            dim_x (int): 输入数据的特征维度
+            window_size (int): 时间窗口长度（时间步数）
+            embed_size (int): 嵌入维度, 默认为256
+            state_est (int): 状态估计标志（代码中未实际使用，可能保留用于扩展）
+        """
         super().__init__()
-        self.dim_x = dim_x
-        self.time_dim = window_size
-        self.embed_size = embed_size
+        
+        # 参数初始化
+        self.dim_x = dim_x            # 输入特征维度（例如关节数）
+        self.time_dim = window_size   # 时间序列长度
+        self.embed_size = embed_size  # 嵌入维度
 
-        dim_mults = (1, 2, 4, 8)
-        dims = [dim_x, *map(lambda m: self.time_dim * m, dim_mults)]
-        in_out = list(zip(dims[:-1], dims[1:]))
+        # 定义编码器/解码器的维度变化倍数
+        dim_mults = (1, 2, 4, 8)                                     # 各层的维度扩展倍数
+        dims = [dim_x, *map(lambda m: self.time_dim * m, dim_mults)] # 实际维度序列
+        in_out = list(zip(dims[:-1], dims[1:]))                      # 输入输出维度配对列表
 
         """
         positional embedding for t
         """
+        # ========== 时间位置编码 ========================================================
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(window_size),
             nn.Linear(window_size, window_size * 4),
@@ -360,37 +384,40 @@ class ControlNet(nn.Module):
             # nn.ReLU(),
             nn.Linear(window_size * 4, self.embed_size),
         )
+        
 
-        # -------------------------------------------------------------------#
-        # ---------------------------- U-Net model --------------------------#
-        # -------------------------------------------------------------------#
-
+        # ========== 基础U-Net模型 ========================================================
         """
         define encoder 
         """
-        self.downs = nn.ModuleList([])
-        self.ups = nn.ModuleList([])
-        num_resolutions = len(in_out)
+        # 编码器部分
+        self.downs = nn.ModuleList([])  # 下采样层
+        self.ups = nn.ModuleList([])    # 上采样层
+        num_resolutions = len(in_out)   # 分辨率层级数
 
         # print(in_out)
+        # 构建编码器（下采样路径）
         for ind, (dim_in, dim_out) in enumerate(in_out):
-            is_last = ind >= (num_resolutions - 1)
+            is_last = ind >= (num_resolutions - 1)  # 是否为最后一层
 
             self.downs.append(
                 nn.ModuleList(
                     [
+                        # 残差时序块（包含跳跃连接和时间嵌入）
                         ResidualTemporalBlock(
                             dim_in,
                             dim_out,
-                            embed_dim=self.embed_size * 2,
+                            embed_dim=self.embed_size * 2,  # 嵌入维度加倍（与语言特征拼接）
                             horizon=self.time_dim,
                         ),
+                        # 第二个残差块（保持维度）
                         ResidualTemporalBlock(
                             dim_out,
                             dim_out,
                             embed_dim=self.embed_size * 2,
                             horizon=self.time_dim,
                         ),
+                        # 下采样层（非最后一层使用）
                         Downsample1d(dim_out) if not is_last else nn.Identity(),
                     ]
                 )
@@ -399,7 +426,8 @@ class ControlNet(nn.Module):
         """
         define bottle neck
         """
-        mid_dim = dims[-1]
+        # 瓶颈层（最深层）
+        mid_dim = dims[-1]  # 最大维度
         self.mid_block1 = ResidualTemporalBlock(
             mid_dim, mid_dim, embed_dim=self.embed_size * 2, horizon=self.time_dim
         )
@@ -410,23 +438,27 @@ class ControlNet(nn.Module):
         """
         define decoder
         """
+        # 解码器部分（上采样路径）
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
             is_last = ind >= (num_resolutions - 1)
             self.ups.append(
                 nn.ModuleList(
                     [
+                        # 残差块（处理拼接特征）
                         ResidualTemporalBlock(
                             dim_out * 2,
                             dim_in,
-                            embed_dim=self.embed_size * 2,
+                            embed_dim=self.embed_size * 2,  # 输入维度加倍（跳跃连接）
                             horizon=self.time_dim,
                         ),
+                        # 第二个残差块
                         ResidualTemporalBlock(
                             dim_in,
                             dim_in,
                             embed_dim=self.embed_size * 2,
                             horizon=self.time_dim,
                         ),
+                        # 上采样层（非最后一层使用）
                         Upsample1d(dim_in) if not is_last else nn.Identity(),
                     ]
                 )
@@ -435,28 +467,30 @@ class ControlNet(nn.Module):
         """
         define fc for language embedding
         """
+        # ========== 语言嵌入处理 ========================================================
         # self.lang_model = OpenlidLangEmbedding(emd_size=self.embed_size)
         self.lang_model = LangEmbedding(emd_size=self.embed_size)
 
         """
         fusion layer
         """
+        # ========== 特征融合层 ===========================================================
         self.fusion_layer = Fusion(emd_size=self.embed_size)
 
         """
         output layer
         """
+        # ========== 输出层 ================================================================
         self.final_conv = nn.Sequential(
             Conv1dBlock(self.time_dim, self.time_dim, kernel_size=5),
             nn.Conv1d(self.time_dim, self.dim_x, 1),
         )
 
-        # -------------------------------------------------------------#
-        # -------------------------- ControlNet -----------------------#
-        # -------------------------------------------------------------#
+        # ========== ControlNet分支 ===========================================================
         """
         define encoder 
         """
+        # 控制网络编码器（复制基础网络的编码器结构）
         self.copy_downs = nn.ModuleList([])
         num_resolutions = len(in_out)
 
@@ -487,6 +521,7 @@ class ControlNet(nn.Module):
         """
         define bottle neck
         """
+        # 控制网络瓶颈层
         mid_dim = dims[-1]
         self.copy_mid_block1 = ResidualTemporalBlock(
             mid_dim, mid_dim, embed_dim=self.embed_size * 2, horizon=self.time_dim
@@ -498,10 +533,12 @@ class ControlNet(nn.Module):
         """
         define zero conv
         """
+        # 控制网络中间层（零初始化卷积）
         self.mid_controlnet_block = self.zero_module(
             nn.Conv1d(mid_dim, mid_dim, kernel_size=1)
         )
 
+        # 控制网络输出转换层（零初始化）
         self.controlnet_blocks = nn.ModuleList([])
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
@@ -510,67 +547,92 @@ class ControlNet(nn.Module):
             )
 
     def zero_module(self, module):
+        """ 将模块参数初始化为零 (用于ControlNet的渐进式控制) """
         for p in module.parameters():
             nn.init.zeros_(p)
         return module
 
     def forward(self, x, obs, lang, control_input, time):
         """
-        add regular conditions
+        前向传播过程
+        Args:
+            x: [bs, dim_x, window_size] 输入序列
+            obs: 观测条件（如传感器数据）
+            lang: 语言指令/描述
+            control_input: 控制信号输入
+            time: 时间步信息
+            
+        Returns:
+            x_out: 输出序列 [bs, dim_x, window_size]
         """
-        t = self.time_mlp(time)
-        lang_emb, label = self.lang_model(lang)
+
+        # ========== 条件特征处理 =====================================================
+        # 时间位置编码
+        t = self.time_mlp(time)                 # [bs, embed_size]
+        # 语言嵌入
+        lang_emb, label = self.lang_model(lang) # lang_emb: [bs, embed_size]
 
         # add fusion layer
-        emb = self.fusion_layer(obs, lang_emb)
-        t = torch.cat([t, emb], axis=-1)
-        input_x = x
+         # 特征融合（观测+语言）
+        emb = self.fusion_layer(obs, lang_emb)  # [bs, embed_size]
+        t = torch.cat([t, emb], axis=-1)        # [bs, embed_size*2]
+        input_x = x    # 保存原始输入
 
         """
         base model encoder
         """
-        h = []
+        # ========== 基础U-Net编码器 ==================================================
+        h = []   # 保存各层特征用于跳跃连接
         for resnet, resnet2, downsample in self.downs:
-            x = resnet(x, t)
-            x = resnet2(x, t)
-            h.append(x)
-            x = downsample(x)
+            x = resnet(x, t)       # 残差块1
+            x = resnet2(x, t)      # 残差块2
+            h.append(x)            # 保存特征
+            x = downsample(x)      # 下采样
+        
+        # 瓶颈层处理
         x = self.mid_block1(x, t)
         x = self.mid_block2(x, t)
 
         """
         controlnet encoder
         """
-        x_hat = control_input + input_x
-        h_hat = []
+        # ========== ControlNet编码器 ==================================================
+        x_hat = control_input + input_x   # 控制信号与输入融合
+        h_hat = []   # 保存控制网络各层特征
         for resnet, resnet2, downsample in self.copy_downs:
             x_hat = resnet(x_hat, t)
             x_hat = resnet2(x_hat, t)
             h_hat.append(x_hat)
             x_hat = downsample(x_hat)
+
+        # 控制网络瓶颈层
         x_hat = self.copy_mid_block1(x_hat, t)
         x_hat = self.copy_mid_block2(x_hat, t)
 
         """
         add feature for the middle blocks
         """
+        # 控制特征融合（零初始化卷积）
         x_hat = self.mid_controlnet_block(x_hat)
-        x = x + x_hat
+        x = x + x_hat  # 将控制特征添加到基础网络
 
         """
         base model decoder + controlnet feature
         """
+        # ========== 基础U-Net解码器（融合控制特征） =======================================
         for resnet, resnet2, upsample in self.ups:
             # print("---")
-            x = x + h_hat.pop()
-            x = torch.cat((x, h.pop()), dim=1)
+            x = x + h_hat.pop()                 # 添加控制网络对应层特征
+            x = torch.cat((x, h.pop()), dim=1)  # 拼接基础网络跳跃连接
             # print(x.shape)
-            x = resnet(x, t)
+            x = resnet(x, t)    # 残差块1
             # print(x.shape)
-            x = resnet2(x, t)
+            x = resnet2(x, t)   # 残差块2
             # print(x.shape)
-            x = upsample(x)
+            x = upsample(x)     # 上采样
             # print(x.shape)
+
+        # ========== 最终输出层 ===========================================================
         x_out = self.final_conv(x)
         return x_out
 

@@ -241,6 +241,7 @@ class Engine:
         # -----------------------------------------------------------------------------#
         # ------------------------------ diffusion sampling ---------------------------#
         # -----------------------------------------------------------------------------#
+        # ========== 推理：反向去噪过程，用于预测动作 =====================================
         self.noise_scheduler.set_timesteps(50)
         # initialize action from Guassian noise
         noisy_action = torch.randn((1, self.dim_x, self.win_size)).to(self.device)

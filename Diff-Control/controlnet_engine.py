@@ -1,3 +1,30 @@
+"""
+条件控制机制​​
+# 多模态条件融合
+text_features = CLIP(sentence)      # 文本条件
+img_emb = SensorModel(images)       # 视觉条件
+prior_action = history_actions      # 动作序列条件
+# ControlNet的交叉注意力层会将这些条件融合到生成过程中
+
+状态保持设计​
+# StatefulUNet 的实现
+class StatefulUNet(nn.Module):
+    def __init__(self, window_size):
+        self.lstm = nn.LSTM(...)  # ⇦ 记忆历史状态
+    def forward(self, x, hidden_state):
+        out, new_state = self.lstm(x, hidden_state)
+        return out, new_state
+
+EMA 模型平滑​
+self.ema = EMAModel(parameters(), power=0.75)
+# 每次更新后调用
+self.ema.step()  
+# 测试时使用EMA模型
+self.ema_nets = self.model
+self.ema.copy_to(self.ema_nets.parameters())
+"""
+
+
 import argparse
 import logging
 import os
@@ -5,7 +32,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
-import clip
+import clip     # CLIP文本编码
 from model import (
     UNetwithControl,
     SensorModel,
@@ -13,7 +40,9 @@ from model import (
     StatefulControlNet,
     StatefulUNet,
 )
-from dataset.lid_pick_and_place import *
+# 数据集加载
+from dataset.lid_pick_and_place import *  # 不同任务的Dataset类
+# 优化与训练工具
 from dataset.tomato_pick_and_place import *
 from dataset.pick_duck import *
 from dataset.drum_hit import *
@@ -25,6 +54,7 @@ import time
 import random
 import pickle
 
+# 扩散模型工具
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
@@ -32,10 +62,11 @@ from diffusers.optimization import get_scheduler
 
 class Engine:
     def __init__(self, args, logger):
-        self.args = args
-        self.logger = logger
-        self.batch_size = self.args.train.batch_size
-        self.dim_x = self.args.train.dim_x
+        # 基础配置
+        self.args = args        # 配置文件参数
+        self.logger = logger    # 日志记录器
+        self.batch_size = self.args.train.batch_size  # ⇦ 从yaml加载
+        self.dim_x = self.args.train.dim_x            # 状态维度
         self.dim_z = self.args.train.dim_z
         self.dim_a = self.args.train.dim_a
         self.dim_gt = self.args.train.dim_gt
@@ -50,6 +81,7 @@ class Engine:
         self.global_step = 0
         self.mode = self.args.mode.mode
 
+        # 根据配置选择数据集类
         if self.args.train.dataset == "OpenLid":
             if self.mode == "train":
                 self.data_path = self.args.train.data_path
@@ -67,28 +99,29 @@ class Engine:
                 self.data_path = self.args.train.data_path
             else:
                 self.data_path = self.args.test.data_path
-            self.dataset = Duck(self.data_path)
+            self.dataset = Duck(self.data_path)             # ⇦ 鸭子抓取数据集
         elif self.args.train.dataset == "Drum":
             if self.mode == "train":
                 self.data_path = self.args.train.data_path
             else:
                 self.data_path = self.args.test.data_path
             self.dataset = Drum(self.data_path)
-
+        
+        # 动态构建ControlNet变体
         if self.args.train.dataset == "Drum":
-            self.base_model = StatefulUNet(dim_x=self.dim_x, window_size=self.win_size)
-            self.model = StatefulControlNet(dim_x=self.dim_x, window_size=self.win_size)
+            self.base_model = StatefulUNet(dim_x=self.dim_x, window_size=self.win_size)     # 带状态记忆的UNet
+            self.model = StatefulControlNet(dim_x=self.dim_x, window_size=self.win_size)    # 对应的ControlNet
         else:
-            self.base_model = UNetwithControl(
-                dim_x=self.dim_x, window_size=self.win_size
-            )
-            self.model = ControlNet(dim_x=self.dim_x, window_size=self.win_size)
+            self.base_model = UNetwithControl(dim_x=self.dim_x, window_size=self.win_size)  # 基础basepolicy1
+            self.model = ControlNet(dim_x=self.dim_x, window_size=self.win_size)            # 标准加了ControlNet的diffusionpolicy2
+        
+        # 传感器编码器
         self.sensor_model = SensorModel(
             state_est=1,
             dim_x=self.dim_x,
             emd_size=256,
             input_channel=self.channel_img_1,
-        )
+        )                               # 处理图像/传感器输入
 
         # -----------------------------------------------------------------------------#
         # ---------------------------    get model ready     --------------------------#
@@ -96,7 +129,7 @@ class Engine:
         # Check model type
         if not isinstance(self.model, nn.Module):
             raise TypeError("model must be an instance of nn.Module")
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")      # 自动选择设备
         if torch.cuda.is_available():
             self.model.cuda()
             self.sensor_model.cuda()
@@ -122,6 +155,7 @@ class Engine:
         # -----------------------------------------------------------------------------#
         # -------------------------- load base model weights  -------------------------#
         # -----------------------------------------------------------------------------#
+        # 训练模式加载预训练权重
         if self.mode == "train":
             # Load the pretrained model
             if torch.cuda.is_available():
@@ -136,65 +170,48 @@ class Engine:
                 checkpoint_2 = torch.load(
                     self.args.test.checkpoint_path_2, map_location=torch.device("cpu")
                 )
-                self.base_model.load_state_dict(checkpoint_1["model"])
+                self.base_model.load_state_dict(checkpoint_1["model"])      # ⇦ 加载基础模型
                 self.sensor_model.load_state_dict(checkpoint_2["model"])
             """
-            make the copy of the base model and lock it
+            复制权重到ControlNet make the copy of the base model and lock it
             """
-            self.model.time_mlp.load_state_dict(self.base_model.time_mlp.state_dict())
-            self.model.lang_model.load_state_dict(
-                self.base_model.lang_model.state_dict()
-            )
-            self.model.fusion_layer.load_state_dict(
-                self.base_model.fusion_layer.state_dict()
-            )
+            self.model.time_mlp.load_state_dict(self.base_model.time_mlp.state_dict())# ⇦ 逐层复制
+            self.model.lang_model.load_state_dict(self.base_model.lang_model.state_dict())
+            self.model.fusion_layer.load_state_dict(self.base_model.fusion_layer.state_dict())
             self.model.downs.load_state_dict(self.base_model.downs.state_dict())
-            self.model.mid_block1.load_state_dict(
-                self.base_model.mid_block1.state_dict()
-            )
-            self.model.mid_block2.load_state_dict(
-                self.base_model.mid_block2.state_dict()
-            )
+            self.model.mid_block1.load_state_dict(self.base_model.mid_block1.state_dict())
+            self.model.mid_block2.load_state_dict(self.base_model.mid_block2.state_dict())
             self.model.ups.load_state_dict(self.base_model.ups.state_dict())
-            self.model.final_conv.load_state_dict(
-                self.base_model.final_conv.state_dict()
-            )
+            self.model.final_conv.load_state_dict(self.base_model.final_conv.state_dict())
             if self.args.train.dataset == "Drum":
-                self.model.addition_module.load_state_dict(
-                    self.base_model.addition_module.state_dict()
-                )
+                self.model.addition_module.load_state_dict(self.base_model.addition_module.state_dict())
 
             """
             make the trainable copy of the base model
             """
             self.model.copy_downs.load_state_dict(self.base_model.downs.state_dict())
-            self.model.copy_mid_block1.load_state_dict(
-                self.base_model.mid_block1.state_dict()
-            )
-            self.model.copy_mid_block2.load_state_dict(
-                self.base_model.mid_block2.state_dict()
-            )
+            self.model.copy_mid_block1.load_state_dict(self.base_model.mid_block1.state_dict())
+            self.model.copy_mid_block2.load_state_dict(self.base_model.mid_block2.state_dict())
             if self.args.train.dataset == "Drum":
-                self.model.copy_addition_module.load_state_dict(
-                    self.base_model.addition_module.state_dict()
-                )
+                self.model.copy_addition_module.load_state_dict(self.base_model.addition_module.state_dict())
 
         # -----------------------------------------------------------------------------#
         # ------------------------------- ema model  ----------------------------------#
         # -----------------------------------------------------------------------------#
+        # 噪声调度器 (50步扩散过程)
         num_diffusion_iters = 50
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=num_diffusion_iters,
             # the choise of beta schedule has big impact on performance
             # we found squared cosine works the best
-            beta_schedule="squaredcos_cap_v2",
+            beta_schedule="squaredcos_cap_v2",                                      # ⇦ 最佳实践方案
             # clip output to [-1,1] to improve stability
-            clip_sample=True,
+            clip_sample=True,                                                       # ⇦ 限制输出范围
             # our network predicts noise (instead of denoised action)
             prediction_type="epsilon",
         )
-        self.ema = EMAModel(parameters=self.model.parameters(), power=0.75)
-        self.clip_model, preprocess = clip.load("ViT-B/32", device=self.device)
+        self.ema = EMAModel(parameters=self.model.parameters(), power=0.75)         # ⇦ 模型平滑
+        self.clip_model, preprocess = clip.load("ViT-B/32", device=self.device)     # ⇦ 文本编码器
         self.sensor_model.eval()
         self.base_model.eval()
 
@@ -202,14 +219,14 @@ class Engine:
         # -----------------------------------------------------------------------------#
         # ---------------------------------    setup     ------------------------------#
         # -----------------------------------------------------------------------------#
-        self.criterion = nn.MSELoss()  # nn.MSELoss() or nn.L1Loss()
+        self.criterion = nn.MSELoss()  # 回归任务损失函数 nn.MSELoss() or nn.L1Loss()
         dataloader = torch.utils.data.DataLoader(
             self.dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=8,
             collate_fn=tomato_pad_collate_xy_lang,
-        )
+        )                               # ⇦ 动态填充函数处理变长序列
         pytorch_total_params = sum(
             p.numel() for p in self.model.parameters() if p.requires_grad
         )
@@ -218,15 +235,16 @@ class Engine:
         """
         only build optimizer for the trainable parts
         """
+        # 优化器仅训练可调部分
         # Create optimizer
         optimizer_ = build_optimizer(
             [
-                self.model.copy_downs,
+                self.model.copy_downs,              # ⇦ 可训练的复制层
                 self.model.copy_mid_block1,
                 self.model.copy_mid_block2,
                 self.model.mid_controlnet_block,
                 # self.model.copy_addition_module,
-                self.model.controlnet_blocks,
+                self.model.controlnet_blocks,       # ⇦ ControlNet新增模块
             ],
             self.args.network.name,
             self.args.optim.optim,
@@ -262,6 +280,7 @@ class Engine:
         while epoch < self.args.train.num_epochs:
             step = 0
             for data in dataloader:
+                # 1.数据准备 images, prior_action, action, sentence = data  # ⇦ 多模态输入
                 data = [item.to(self.device) for item in data]
                 if (
                     self.args.train.dataset == "Tomato"
@@ -273,6 +292,7 @@ class Engine:
                 optimizer_.zero_grad()
                 before_op_time = time.time()
 
+                # 2.CLIP文本编码
                 with torch.no_grad():
                     text_features = self.clip_model.encode_text(sentence)
                     text_features = text_features.clone().detach()
@@ -281,6 +301,7 @@ class Engine:
                 optimizer_.zero_grad()
                 before_op_time = time.time()
 
+                # 3.添加扩散噪声
                 # sample noise to add to actions
                 noise = torch.randn(action.shape, device=self.device)
                 # sample a diffusion iteration for each data point
@@ -289,27 +310,25 @@ class Engine:
                     self.noise_scheduler.config.num_train_timesteps,
                     (action.shape[0],),
                     device=self.device,
-                ).long()
+                ).long()                # ⇦ 随机扩散步
                 # add noise to the clean images according to the noise magnitude at each diffusion iteration
                 # (this is the forward diffusion process)
                 noisy_actions = self.noise_scheduler.add_noise(action, noise, timesteps)
 
-                # forward
-                img_emb = self.sensor_model(images)
-                predicted_noise = self.model(
+                # 4.前向传播# forward
+                img_emb = self.sensor_model(images)         # 图像特征提取
+                predicted_noise = self.model(               # ControlNet预测噪声
                     noisy_actions, img_emb, text_features, prior_action, timesteps
                 )
+                # 5.损失计算与反向传播
                 loss_1 = self.criterion(noise, predicted_noise)
                 loss = loss_1
-
-                # backprop
-                loss.backward()
-
+                loss.backward()# backprop
                 optimizer_.step()
-                self.ema.step(self.model.parameters())
+                self.ema.step(self.model.parameters())      # ⇦ 更新EMA模型
                 current_lr = optimizer_.param_groups[0]["lr"]
 
-                # verbose
+                # verbose 日志记录
                 if self.global_step % self.args.train.log_freq == 0:
                     string = "[epoch][s/s_per_e/gs]: [{}][{}/{}/{}], loss1: {:.12f}"
                     self.logger.info(
@@ -330,6 +349,7 @@ class Engine:
 
                 # tensorboard
                 duration += time.time() - before_op_time
+                # 模型保存
                 if (
                     self.global_step
                     and self.global_step % self.args.train.log_freq == 0
@@ -354,7 +374,7 @@ class Engine:
                 self.ema_nets = self.model
                 checkpoint = {
                     "global_step": self.global_step,
-                    "model": self.ema_nets.state_dict(),
+                    "model": self.ema_nets.state_dict(),# ⇦ 保存EMA模型
                     "optimizer": optimizer_.state_dict(),
                 }
                 torch.save(
@@ -404,7 +424,7 @@ class Engine:
                 self.data_path = self.args.train.data_path
             else:
                 self.data_path = self.args.test.data_path
-            test_dataset = Duck(self.data_path)
+            test_dataset = Duck(self.data_path)             # ⇦ 加载测试集
         elif self.args.train.dataset == "Drum":
             if self.mode == "train":
                 self.data_path = self.args.train.data_path
@@ -413,7 +433,8 @@ class Engine:
             test_dataset = Drum(self.data_path)
         test_dataloader = torch.utils.data.DataLoader(
             test_dataset, batch_size=1, shuffle=True, num_workers=8
-        )
+        )                                                   # ⇦ 单样本测试
+
 
         # save test data
         save_data = {}
@@ -439,11 +460,12 @@ class Engine:
                 # text_features = sentence
                 img_emb = self.sensor_model(images)
 
+                # 初始化噪声动作
                 # initialize action from Guassian noise
                 noisy_action = torch.randn((1, self.dim_x, self.win_size)).to(
                     self.device
                 )
-
+                # 50步去噪过程
                 # init scheduler
                 self.noise_scheduler.set_timesteps(50)
 
@@ -453,8 +475,9 @@ class Engine:
                     t = torch.stack([k]).to(self.device)
                     predicted_noise = self.ema_nets(
                         noisy_action, img_emb, text_features, prior_action, t
-                    )
+                    )# ⇦ 使用EMA模型
 
+                    # 调度器更新步骤
                     # inverse diffusion step (remove noise)
                     noisy_action = self.noise_scheduler.step(
                         model_output=predicted_noise, timestep=k, sample=noisy_action
@@ -471,7 +494,8 @@ class Engine:
                 step = step + 1
                 if step == 10:
                     break
-
+        
+        # 保存轨迹对比数据
         save_data["traj"] = traj_save
         save_data["gt"] = gt_save
         save_data["traj_stack"] = traj_stack
@@ -483,4 +507,4 @@ class Engine:
         )
 
         with open(save_path, "wb") as f:
-            pickle.dump(save_data, f)
+            pickle.dump(save_data, f)# ⇦ 序列化存储

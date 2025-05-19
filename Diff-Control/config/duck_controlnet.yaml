@@ -1,6 +1,6 @@
 mode:
     mode: 'train'
-    model_zoo: 'controlnet'
+    model_zoo: 'controlnet'             # 控制模型：​​BCZ_LSTM​​：带记忆单元的动作序列生成；Tomato-model​​：其他物体操作任务迁移；Pretrain模式​​：在大规模预训练数据上初始化模型
     multiprocessing_distributed: False
     dist_url: tcp://127.0.0.1:2345
     num_threads: 1
@@ -16,33 +16,34 @@ train:
     seed: 0
     model_name: 'duck_controlnet'
     dataset: 'Duck'
-    sensor_len: 2
-    channel_img_1: 3
+    sensor_len: 2           # 传感器数据维度
+    channel_img_1: 3        # RGB图像输入
     channel_img_2: ''
-    input_size_1: 77
+    input_size_1: 77        # 文本/图像编码维度（类似CLIP的77-token结构）
     input_size_2: ''
     input_size_3: ''
+    # 包含鸭子抓取操作的数据集路径
     data_path: [
         '/tf/datasets/pick_duck/pick_duck_1',
         '/tf/datasets/pick_duck/pick_duck_2',
     ]
-    batch_size: 64
-    num_epochs: 1000
-    learning_rate: 1e-4
+    batch_size: 64          # 大批量提升稳定性
+    num_epochs: 1000        # 适合扩散模型的低学习率
+    learning_rate: 1e-4 
     weight_decay: 1e-6
     adam_eps: 1e-3
     log_freq: 10
     eval_freq: 100
     save_freq: 100
     log_directory: './experiments'
-    loss: 'mse'
+    loss: 'mse'             # 回归任务标准损失
 test:
-    dim_x: 10
+    dim_x: 10               # 状态空间维度
     dim_z: ''
-    dim_a: 10
-    dim_gt: 10
-    num_ensemble: 32
-    win_size: 24
+    dim_a: 10               # 动作空间维度
+    dim_gt: 10              # 监督信号维度
+    num_ensemble: 32        # 集成模型数量（提升鲁棒性）
+    win_size: 24            # 窗口机制（win_size=24）处理时序依赖
     model_name: 'duck_controlnet'
     data_path: [
         '/tf/datasets/pick_duck/pick_duck_1',
@@ -57,5 +58,5 @@ test:
     checkpoint_path_2: './experiments/duck_model/sensor_model-98000'
     dataset: 'Duck'
 optim:
-    optim: 'adamw'
+    optim: 'adamw'          # 带权重衰减的优化器
     lr_scheduler: 'polynomial_decay'
